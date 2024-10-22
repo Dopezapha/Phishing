@@ -9,12 +9,56 @@
 (define-constant TIME_RESTRICTION_ERROR (err u105))
 (define-constant LIMIT_BREACH_ERROR (err u106))
 (define-constant TEMPORAL_ERROR (err u107))
+(define-constant INVALID_WEB_IDENTIFIER (err u400))
+(define-constant INVALID_SECURITY_ENDORSEMENT (err u401))
+(define-constant INVALID_PROOF_DOCUMENTATION (err u402))
+(define-constant INVALID_THREAT_MAGNITUDE (err u403))
+(define-constant INVALID_PROTECTION_LEVEL (err u404))
+(define-constant INVALID_CONTROLLER_ADDRESS (err u405))
 
 ;; System constants
 (define-constant INACTIVITY_WINDOW u86400) ;; 24 hours in seconds
 (define-constant BASE_COLLATERAL_REQUIREMENT u1000000) ;; in microSTX
 (define-constant TRUSTWORTHINESS_BASELINE u50)
 (define-constant EVIDENCE_STRING_LIMIT u500)
+
+;; Input validation functions
+(define-private (validate-web-identifier (web_id (string-ascii 255)))
+    (begin
+        (asserts! (>= (len web_id) u3) (err "Web ID too short"))  ;; Minimum length check
+        (asserts! (<= (len web_id) u255) (err "Web ID too long"))  ;; Maximum length check
+        (asserts! (is-eq (index-of web_id ".") none) (err "Invalid character: ."))  ;; No direct dots allowed
+        (asserts! (is-eq (index-of web_id "/") none) (err "Invalid character: /"))  ;; No direct slashes allowed
+        (asserts! (is-eq (index-of web_id " ") none) (err "Invalid character: space"))  ;; No spaces allowed
+        (ok true)))
+
+(define-private (validate-security-endorsement (endorsement (string-ascii 50)))
+    (begin
+        (asserts! (>= (len endorsement) u5) (err "Endorsement too short"))  ;; Minimum length check
+        (asserts! (<= (len endorsement) u50) (err "Endorsement too long"))  ;; Maximum length check
+        (asserts! (is-eq (index-of endorsement "<") none) (err "Invalid character: <"))  ;; No HTML-like characters
+        (asserts! (is-eq (index-of endorsement ">") none) (err "Invalid character: >"))
+        (ok true)))
+
+(define-private (validate-proof-documentation (proof (string-ascii 500)))
+    (begin
+        (asserts! (>= (len proof) u10) (err "Proof documentation too short"))
+        (asserts! (<= (len proof) u500) (err "Proof documentation too long"))
+        (asserts! (is-eq (index-of proof "<") none) (err "Invalid character: <"))
+        (asserts! (is-eq (index-of proof ">") none) (err "Invalid character: >"))
+        (ok true)))
+
+(define-private (validate-threat-magnitude (magnitude uint))
+    (begin
+        (asserts! (>= magnitude u1) (err "Threat magnitude too low"))
+        (asserts! (<= magnitude u100) (err "Threat magnitude too high"))
+        (ok true)))
+
+(define-private (validate-protection-level (level uint))
+    (begin
+        (asserts! (>= level u1) (err "Protection level too low"))
+        (asserts! (<= level u10) (err "Protection level too high"))
+        (ok true)))
 
 ;; Administrative state variables
 (define-data-var system_controller principal tx-sender)
@@ -99,11 +143,17 @@
     (let (
         (current_epoch (unwrap-panic (get-block-info? time (- block-height u1))))
         (collateral_requirement (* BASE_COLLATERAL_REQUIREMENT (var-get protection_intensity))))
-        (asserts! (is-eq tx-sender (var-get system_controller)) (err ACCESS_FORBIDDEN))
-        (asserts! (>= (stx-get-balance tx-sender) collateral_requirement) (err COLLATERAL_MISSING_ERROR))
+        
+        ;; Input validation
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (is-ok (validate-security-endorsement security_endorsement)) INVALID_SECURITY_ENDORSEMENT)
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (>= (stx-get-balance tx-sender) collateral_requirement) COLLATERAL_MISSING_ERROR)
+        
         (match (map-get? registered_sites {web_identifier: web_identifier})
-            some_entry (err DUPLICATE_ENTRY_ERROR)
+            some_entry DUPLICATE_ENTRY_ERROR
             (begin
+                (try! (stx-transfer? collateral_requirement tx-sender (as-contract tx-sender)))
                 (map-set registered_sites
                     {web_identifier: web_identifier}
                     {
@@ -116,8 +166,6 @@
                         safety_check_epoch: current_epoch,
                         security_endorsement: security_endorsement
                     })
-                (unwrap! (stx-transfer? collateral_requirement tx-sender (as-contract tx-sender)) 
-                         (err COLLATERAL_MISSING_ERROR))
                 (ok true)))))
 
 (define-public (submit_threat_alert 
@@ -129,9 +177,14 @@
         (sentinel_data (default-to 
             {submission_count: u0, last_action_epoch: u0, credibility_score: u0, reserved_funds: u0, verified_submissions: u0}
             (map-get? sentinel_performance_log {sentinel_id: tx-sender, target_site: web_identifier}))))
-        (asserts! (not (var-get system_pause_state)) (err OPERATION_BLOCKED_ERROR))
-        (asserts! (>= (get credibility_score sentinel_data) TRUSTWORTHINESS_BASELINE) (err COLLATERAL_MISSING_ERROR))
-        (asserts! (> (- current_epoch (get last_action_epoch sentinel_data)) INACTIVITY_WINDOW) (err TIME_RESTRICTION_ERROR))
+        
+        ;; Input validation
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (is-ok (validate-proof-documentation proof_documentation)) INVALID_PROOF_DOCUMENTATION)
+        (asserts! (is-ok (validate-threat-magnitude threat_magnitude)) INVALID_THREAT_MAGNITUDE)
+        (asserts! (not (var-get system_pause_state)) OPERATION_BLOCKED_ERROR)
+        (asserts! (>= (get credibility_score sentinel_data) TRUSTWORTHINESS_BASELINE) COLLATERAL_MISSING_ERROR)
+        (asserts! (> (- current_epoch (get last_action_epoch sentinel_data)) INACTIVITY_WINDOW) TIME_RESTRICTION_ERROR)
         
         (map-set malicious_site_registry
             {web_identifier: web_identifier}
@@ -156,26 +209,32 @@
         (ok true)))
 
 (define-private (modify_site_risk (web_identifier (string-ascii 255)) (adjustment_value int))
-    (match (map-get? registered_sites {web_identifier: web_identifier})
-        some_entry (begin
-            (map-set registered_sites
-                {web_identifier: web_identifier}
-                (merge some_entry {
-                    threat_metric: (+ (get threat_metric some_entry) 
-                        (if (> adjustment_value i0) 
-                            (to-uint adjustment_value)
-                            u0))
-                }))
-            (ok true))
-        (err ENTRY_MISSING_ERROR)))
+    (begin 
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (match (map-get? registered_sites {web_identifier: web_identifier})
+            some_entry 
+                (begin
+                    (map-set registered_sites
+                        {web_identifier: web_identifier}
+                        (merge some_entry {
+                            threat_metric: (+ (get threat_metric some_entry) 
+                                (if (> adjustment_value 0) 
+                                    (to-uint adjustment_value)
+                                    u0))
+                        }))
+                    (ok true))
+            ENTRY_MISSING_ERROR)))
 
 (define-public (validate_threat_report 
     (web_identifier (string-ascii 255))
     (is_valid bool))
     (let (
         (current_epoch (unwrap-panic (get-block-info? time (- block-height u1))))
-        (sentinel_status (unwrap! (map-get? sentinel_registry {sentinel_id: tx-sender}) (err ACCESS_FORBIDDEN))))
-        (asserts! (>= (get reserved_amount sentinel_status) BASE_COLLATERAL_REQUIREMENT) (err COLLATERAL_MISSING_ERROR))
+        (sentinel_status (unwrap! (map-get? sentinel_registry {sentinel_id: tx-sender}) ACCESS_FORBIDDEN)))
+        
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (>= (get reserved_amount sentinel_status) BASE_COLLATERAL_REQUIREMENT) COLLATERAL_MISSING_ERROR)
+        
         (map-set sentinel_registry
             {sentinel_id: tx-sender}
             (merge sentinel_status {
@@ -183,14 +242,14 @@
                 recent_activity_epoch: current_epoch
             }))
         (if is_valid
-            (modify_site_risk web_identifier u10)
-            (modify_site_risk web_identifier (- u0 u5)))))
+            (modify_site_risk web_identifier 10)
+            (modify_site_risk web_identifier -5))))
 
 (define-public (enlist_sentinel (collateral_amount uint))
     (let (
         (current_epoch (unwrap-panic (get-block-info? time (- block-height u1)))))
-        (asserts! (>= collateral_amount BASE_COLLATERAL_REQUIREMENT) (err COLLATERAL_MISSING_ERROR))
-        (asserts! (>= (stx-get-balance tx-sender) collateral_amount) (err COLLATERAL_MISSING_ERROR))
+        (asserts! (>= collateral_amount BASE_COLLATERAL_REQUIREMENT) COLLATERAL_MISSING_ERROR)
+        (asserts! (>= (stx-get-balance tx-sender) collateral_amount) COLLATERAL_MISSING_ERROR)
         
         (map-set sentinel_registry
             {sentinel_id: tx-sender}
@@ -202,32 +261,35 @@
                 operational_mode: "active"
             })
         (unwrap! (stx-transfer? collateral_amount tx-sender (as-contract tx-sender))
-                 (err COLLATERAL_MISSING_ERROR))
+                 COLLATERAL_MISSING_ERROR)
         (ok true)))
 
 ;; System management functions
 (define-public (modify_protection_level (new_level uint))
     (begin
-        (asserts! (is-eq tx-sender (var-get system_controller)) (err ACCESS_FORBIDDEN))
+        (asserts! (is-ok (validate-protection-level new_level)) INVALID_PROTECTION_LEVEL)
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
         (var-set protection_intensity new_level)
         (ok true)))
 
 (define-public (toggle_system_state (pause_state bool))
     (begin
-        (asserts! (is-eq tx-sender (var-get system_controller)) (err ACCESS_FORBIDDEN))
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
         (var-set system_pause_state pause_state)
         (ok true)))
 
 (define-public (reassign_system_control (new_controller principal))
     (begin
-        (asserts! (is-eq tx-sender (var-get system_controller)) (err ACCESS_FORBIDDEN))
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (not (is-eq new_controller 'SP000000000000000000002Q6VF78)) INVALID_CONTROLLER_ADDRESS)
         (var-set system_controller new_controller)
         (ok true)))
 
 ;; System initialization
 (define-public (initialize_system (admin principal))
     (begin
-        (asserts! (is-eq tx-sender (var-get system_controller)) (err ACCESS_FORBIDDEN))
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (not (is-eq admin 'SP000000000000000000002Q6VF78)) INVALID_CONTROLLER_ADDRESS)
         (var-set system_controller admin)
         (var-set protection_intensity u1)
         (var-set system_pause_state false)
